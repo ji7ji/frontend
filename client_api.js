@@ -1,6 +1,6 @@
 
 // Auto-generated Client API
-const API_BASE = "https://statuesque-cupcake-e8da00.netlify.app/";
+const API_BASE = "https://statuesque-cupcake-e8da00.netlify.app:3000";
 
 document.addEventListener('DOMContentLoaded', () => {
     document.querySelectorAll('form').forEach(form => {
