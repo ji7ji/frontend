@@ -1,6 +1,6 @@
 
 // Auto-generated Client API
-const API_BASE = "https://ji7ji-1304029630.cos.ap-hongkong.myqcloud.com/anim/";
+const API_BASE = "https://statuesque-cupcake-e8da00.netlify.app/";
 
 document.addEventListener('DOMContentLoaded', () => {
     document.querySelectorAll('form').forEach(form => {
