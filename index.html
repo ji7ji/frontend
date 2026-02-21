@@ -1,612 +1,517 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { 
-  MessageCircle, 
-  Users, 
-  Compass, 
-  User, 
-  Camera, 
-  Image as ImageIcon, 
-  Video, 
-  X,
-  ChevronLeft,
-  Settings
-} from 'lucide-react';
-import { 
-  initializeApp 
-} from 'firebase/app';
-import { 
-  getAuth, 
-  signInAnonymously, 
-  signInWithCustomToken, 
-  onAuthStateChanged 
-} from 'firebase/auth';
-import { 
-  getFirestore, 
-  collection, 
-  doc, 
-  setDoc, 
-  onSnapshot, 
-  addDoc, 
-  deleteDoc,
-  serverTimestamp
-} from 'firebase/firestore';
-
-// ==========================================
-// 1. Firebase 初始化与环境配置
-// ==========================================
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'wechat-clone-app';
-const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
-let app, auth, db;
-
-try {
-  app = initializeApp(firebaseConfig);
-  auth = getAuth(app);
-  db = getFirestore(app);
-} catch (e) {
-  console.error("Firebase 初始化失败:", e);
-}
-
-// ==========================================
-// 2. 核心数据库接口层 (Database Interface)
-// 针对用户的登录名(UID)封装的API
-// ==========================================
-const dbInterface = {
-  // 基础路径定义
-  paths: {
-    profiles: () => collection(db, 'artifacts', appId, 'public', 'data', 'profiles'),
-    posts: () => collection(db, 'artifacts', appId, 'public', 'data', 'posts')
-  },
-
-  // 更新/设置用户信息 (头像, 登录名)
-  setUserProfile: async (uid, username, avatarDataUrl) => {
-    if (!uid) return;
-    const profileRef = doc(dbInterface.paths.profiles(), uid);
-    await setDoc(profileRef, {
-      username: username || '微信用户',
-      avatar: avatarDataUrl || '',
-      updatedAt: serverTimestamp()
-    }, { merge: true });
-  },
-
-  // 发布新动态 (图文/视频)
-  createPost: async (uid, text, mediaUrl, mediaType) => {
-    if (!uid) return;
-    await addDoc(dbInterface.paths.posts(), {
-      uid: uid,
-      text: text,
-      mediaUrl: mediaUrl || '',
-      mediaType: mediaType || 'none', // 'none', 'image', 'video'
-      timestamp: Date.now() // 使用本地时间戳便于本地排序
-    });
-  },
-
-  // 删除动态
-  deletePost: async (postId) => {
-    const postRef = doc(dbInterface.paths.posts(), postId);
-    await deleteDoc(postRef);
-  }
-};
-
-// ==========================================
-// 3. 辅助工具函数
-// ==========================================
-// 压缩图片并转为 Base64 (避免超出数据库1MB限制)
-const processImageFile = (file) => {
-  return new Promise((resolve) => {
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      const img = new window.Image();
-      img.onload = () => {
-        const canvas = document.createElement('canvas');
-        const MAX_WIDTH = 800;
-        let width = img.width;
-        let height = img.height;
-
-        if (width > MAX_WIDTH) {
-          height = Math.round((height *= MAX_WIDTH / width));
-          width = MAX_WIDTH;
-        }
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext('2d');
-        ctx.drawImage(img, 0, 0, width, height);
-        resolve(canvas.toDataURL('image/jpeg', 0.6));
-      };
-      img.src = e.target.result;
-    };
-    reader.readAsDataURL(file);
-  });
-};
-
-// ==========================================
-// 4. 主应用组件
-// ==========================================
-export default function App() {
-  const [user, setUser] = useState(null);
-  const [appState, setAppState] = useState('loading'); // 'loading', 'login', 'main'
-  const [activeTab, setActiveTab] = useState('discover'); // 默认显示发现页(朋友圈)
-  const [profiles, setProfiles] = useState({});
-  const [posts, setPosts] = useState([]);
-
-  // 状态：初始登录页面相关
-  const [loginUsername, setLoginUsername] = useState('');
-  const [loginAvatar, setLoginAvatar] = useState('');
-
-  // 状态：发布动态相关
-  const [isPosting, setIsPosting] = useState(false);
-  const [postText, setPostText] = useState('');
-  const [postMedia, setPostMedia] = useState(null);
-  const [postMediaType, setPostMediaType] = useState('none');
-
-  // 状态：个人信息设置相关
-  const [isEditingProfile, setIsEditingProfile] = useState(false);
-  const [editUsername, setEditUsername] = useState('');
-
-  // 1. 处理身份验证
-  useEffect(() => {
-    if (!auth) return;
-    const initAuth = async () => {
-      try {
-        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-          await signInWithCustomToken(auth, __initial_auth_token);
-        } else {
-          await signInAnonymously(auth);
-        }
-      } catch (err) {
-        console.error("Auth error:", err);
-      }
-    };
-    initAuth();
-
-    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
-      setUser(currentUser);
-    });
-    return () => unsubscribe();
-  }, []);
-
-  // 2. 监听数据库 (Profiles & Posts)
-  useEffect(() => {
-    if (!user || !db) return;
-
-    // 监听所有用户信息
-    const unsubProfiles = onSnapshot(
-      dbInterface.paths.profiles(), 
-      (snapshot) => {
-        const profData = {};
-        snapshot.forEach(doc => {
-          profData[doc.id] = doc.data();
-        });
-        setProfiles(profData);
-        
-        // 判断当前用户是否已经创建了档案
-        if (!profData[user.uid]) {
-          setAppState('login');
-        } else {
-          setAppState('main');
-        }
-      },
-      (error) => console.error("Profile fetch error:", error)
-    );
-
-    // 监听所有动态
-    const unsubPosts = onSnapshot(
-      dbInterface.paths.posts(),
-      (snapshot) => {
-        const postsData = [];
-        snapshot.forEach(doc => {
-          postsData.push({ id: doc.id, ...doc.data() });
-        });
-        // 本地按时间倒序排序
-        postsData.sort((a, b) => b.timestamp - a.timestamp);
-        setPosts(postsData);
-      },
-      (error) => console.error("Posts fetch error:", error)
-    );
-
-    return () => {
-      unsubProfiles();
-      unsubPosts();
-    };
-  }, [user]);
-
-  // ==========================================
-  // 交互处理函数
-  // ==========================================
-
-  // 登录页面：处理头像上传
-  const handleLoginAvatarUpload = async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    const base64Img = await processImageFile(file);
-    setLoginAvatar(base64Img);
-  };
-
-  // 登录页面：提交信息并进入应用
-  const handleLoginSubmit = async () => {
-    if (!loginUsername.trim()) return;
-    // 提交到数据库，onSnapshot 监听到数据后会自动将 appState 切换至 'main'
-    await dbInterface.setUserProfile(user.uid, loginUsername, loginAvatar);
-  };
-
-  // 处理媒体文件选择 (发朋友圈)
-  const handleMediaSelect = async (e, type) => {
-    const file = e.target.files[0];
-    if (!file) return;
-
-    if (type === 'image') {
-      const base64Img = await processImageFile(file);
-      setPostMedia(base64Img);
-      setPostMediaType('image');
-    } else if (type === 'video') {
-      const videoUrl = URL.createObjectURL(file);
-      setPostMedia(videoUrl);
-      setPostMediaType('video');
-    }
-  };
-
-  // 提交发布动态
-  const handlePublishPost = async () => {
-    if (!postText.trim() && !postMedia) return;
-    await dbInterface.createPost(user.uid, postText, postMedia, postMediaType);
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>WeChat Mock - 独立本地版</title>
+    <!-- 引入 Tailwind CSS 进行快速样式构建 -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 引入 FontAwesome 图标库 -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     
-    // 重置状态
-    setPostText('');
-    setPostMedia(null);
-    setPostMediaType('none');
-    setIsPosting(false);
-  };
-
-  // 处理“我”页面头像上传
-  const handleAvatarUpload = async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    const base64Img = await processImageFile(file);
-    await dbInterface.setUserProfile(user.uid, profiles[user.uid]?.username, base64Img);
-  };
-
-  // 保存“我”页面用户名修改
-  const handleSaveProfile = async () => {
-    if (!editUsername.trim()) return;
-    await dbInterface.setUserProfile(user.uid, editUsername, profiles[user.uid]?.avatar);
-    setIsEditingProfile(false);
-  };
-
-  // ==========================================
-  // UI 渲染模块
-  // ==========================================
-  
-  // 1. 加载中状态
-  if (appState === 'loading') {
-    return <div className="flex h-screen items-center justify-center bg-gray-100 text-gray-500">正在连接服务器...</div>;
-  }
-
-  // 2. 登录/欢迎界面
-  if (appState === 'login') {
-    return (
-      <div className="flex justify-center bg-gray-900 h-screen font-sans">
-        <div className="w-full max-w-[400px] bg-white h-full relative shadow-2xl flex flex-col items-center pt-24 px-8">
-          <h1 className="text-3xl font-medium text-gray-800 mb-12">欢迎使用</h1>
-          
-          <div className="flex flex-col items-center w-full space-y-8">
-            {/* 头像上传区 */}
-            <div className="flex flex-col items-center">
-              <div className="relative mb-2">
-                <div className="w-24 h-24 rounded-2xl overflow-hidden bg-gray-100 border border-gray-200 flex items-center justify-center shadow-sm">
-                  {loginAvatar ? (
-                    <img src={loginAvatar} className="w-full h-full object-cover" alt="avatar" />
-                  ) : (
-                    <Camera size={32} className="text-gray-400" />
-                  )}
-                </div>
-                <label className="absolute inset-0 cursor-pointer">
-                  <input type="file" accept="image/*" className="hidden" onChange={handleLoginAvatarUpload} />
-                </label>
-              </div>
-              <span className="text-sm text-gray-400">点击上传头像 (选填)</span>
-            </div>
-
-            {/* 用户名输入区 */}
-            <div className="w-full">
-              <input 
-                type="text" 
-                value={loginUsername}
-                onChange={(e) => setLoginUsername(e.target.value)}
-                className="w-full border-b border-gray-300 outline-none py-3 text-lg text-center focus:border-[#07C160] transition-colors placeholder-gray-300"
-                placeholder="请输入您的昵称"
-                autoFocus
-              />
-            </div>
-
-            {/* 登录按钮 */}
-            <button 
-              onClick={handleLoginSubmit}
-              disabled={!loginUsername.trim()}
-              className="w-full bg-[#07C160] text-white py-3.5 rounded-lg mt-8 text-[17px] font-medium disabled:opacity-50 disabled:bg-[#07C160]/50 active:bg-[#06ad56] transition-colors"
-            >
-              进入微信
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // 3. 主界面
-  const currentUserProfile = profiles[user?.uid] || { username: '加载中...', avatar: '' };
-  const defaultAvatar = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239CA3AF' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2'/%3E%3Ccircle cx='12' cy='7' r='4'/%3E%3C/svg%3E";
-
-  return (
-    <div className="flex justify-center bg-gray-900 h-screen font-sans">
-      {/* 手机模拟容器 */}
-      <div className="w-full max-w-[400px] bg-gray-50 h-full relative shadow-2xl flex flex-col overflow-hidden">
+    <script>
+        // 配置 Tailwind 主题色（微信风格）
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        'wechat-bg': '#ededed',
+                        'wechat-green': '#95ec69',
+                        'wechat-dark-green': '#07c160',
+                        'wechat-header': '#f5f5f5',
+                        'wechat-text-dark': '#1a1a1a',
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        /* 隐藏滚动条但保留滚动功能 */
+        .no-scrollbar::-webkit-scrollbar {
+            display: none;
+        }
+        .no-scrollbar {
+            -ms-overflow-style: none;
+            scrollbar-width: none;
+        }
         
-        {/* === 顶部导航栏 === */}
-        <div className="bg-gray-100 px-4 pt-12 pb-3 flex justify-between items-center z-10 sticky top-0 border-b border-gray-200">
-          <span className="font-semibold text-gray-800 text-lg">
-            {activeTab === 'chat' && '微信'}
-            {activeTab === 'contacts' && '通讯录'}
-            {activeTab === 'discover' && '发现'}
-            {activeTab === 'me' && ''}
-          </span>
-          {activeTab === 'discover' && (
-            <button onClick={() => setIsPosting(true)} className="p-1 hover:bg-gray-200 rounded-full transition-colors">
-              <Camera size={24} className="text-gray-700" />
-            </button>
-          )}
-        </div>
+        /* 聊天气泡的小尾巴 */
+        .bubble-right::after {
+            content: '';
+            position: absolute;
+            right: -8px;
+            top: 12px;
+            border-top: 6px solid transparent;
+            border-bottom: 6px solid transparent;
+            border-left: 8px solid #95ec69;
+        }
+        .bubble-left::after {
+            content: '';
+            position: absolute;
+            left: -8px;
+            top: 12px;
+            border-top: 6px solid transparent;
+            border-bottom: 6px solid transparent;
+            border-right: 8px solid white;
+        }
 
-        {/* === 主内容区 === */}
-        <div className="flex-1 overflow-y-auto pb-16 bg-white hide-scrollbar">
-          
-          {/* 1. 微信 (占位) */}
-          {activeTab === 'chat' && (
-            <div className="flex flex-col items-center justify-center h-full text-gray-400 space-y-4">
-              <MessageCircle size={48} />
-              <p>暂无聊天记录</p>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, Segoe UI, Arial, Roboto, 'PingFang SC', 'miui', 'Hiragino Sans GB', 'Microsoft Yahei', sans-serif;
+        }
+    </style>
+</head>
+<body class="bg-gray-200 h-screen w-screen flex justify-center items-center overflow-hidden">
+
+    <!-- 移动端容器（模拟手机屏幕） -->
+    <div class="bg-wechat-bg w-full h-full sm:w-[400px] sm:h-[800px] sm:rounded-3xl sm:shadow-2xl sm:border-4 border-gray-800 flex flex-col relative overflow-hidden">
+        
+        <!-- ================= 登录/注册界面 ================= -->
+        <div id="login-screen" class="absolute inset-0 bg-white z-50 flex flex-col items-center justify-center p-6">
+            <div class="text-4xl text-wechat-dark-green mb-8">
+                <i class="fa-solid fa-comment-dots"></i>
             </div>
-          )}
-
-          {/* 2. 发现 -> 朋友圈 */}
-          {activeTab === 'discover' && (
-            <div className="bg-white min-h-full">
-              {/* 朋友圈封面 */}
-              <div className="relative h-64 bg-gray-800 flex items-center justify-center overflow-hidden">
-                <img 
-                  src="https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=800&q=80" 
-                  alt="cover" 
-                  className="absolute inset-0 w-full h-full object-cover opacity-80"
-                />
-                {/* 封面右下角个人信息 */}
-                <div className="absolute -bottom-6 right-4 flex items-center space-x-4">
-                  <span className="text-white font-bold text-lg drop-shadow-md">{currentUserProfile.username}</span>
-                  <div className="w-16 h-16 rounded-xl overflow-hidden border-2 border-white bg-white shadow-sm">
-                    <img src={currentUserProfile.avatar || defaultAvatar} className="w-full h-full object-cover" alt="avatar" />
-                  </div>
-                </div>
-              </div>
-
-              {/* 朋友圈列表 */}
-              <div className="pt-12 px-4 pb-4 space-y-6">
-                {posts.map(post => {
-                  const postUser = profiles[post.uid] || { username: '未知用户', avatar: defaultAvatar };
-                  return (
-                    <div key={post.id} className="flex space-x-3 border-b border-gray-100 pb-6">
-                      {/* 头像 */}
-                      <img src={postUser.avatar || defaultAvatar} className="w-10 h-10 rounded-md object-cover flex-shrink-0 bg-gray-200" alt="avatar" />
-                      
-                      {/* 内容 */}
-                      <div className="flex-1">
-                        <div className="font-semibold text-[#576b95] text-[15px] mb-1">{postUser.username}</div>
-                        {post.text && <p className="text-gray-800 text-[15px] leading-relaxed mb-2 whitespace-pre-wrap">{post.text}</p>}
-                        
-                        {/* 媒体展示 */}
-                        {post.mediaType === 'image' && post.mediaUrl && (
-                          <img src={post.mediaUrl} className="max-w-[200px] max-h-[250px] object-cover rounded-sm mt-2 cursor-pointer" alt="post media" />
-                        )}
-                        {post.mediaType === 'video' && post.mediaUrl && (
-                          <video src={post.mediaUrl} controls className="max-w-[220px] max-h-[300px] rounded-sm mt-2 bg-black" />
-                        )}
-
-                        {/* 时间戳与操作 */}
-                        <div className="flex justify-between items-center mt-3">
-                          <span className="text-xs text-gray-400">
-                            {new Date(post.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
-                          </span>
-                          {post.uid === user.uid && (
-                            <button onClick={() => dbInterface.deletePost(post.id)} className="text-xs text-[#576b95] hover:text-[#435375]">删除</button>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })}
-                {posts.length === 0 && (
-                  <div className="text-center text-gray-400 pt-10 text-sm">点击右上角相机发布第一条动态吧</div>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* 3. 我 (个人中心) */}
-          {activeTab === 'me' && (
-            <div className="bg-gray-100 min-h-full">
-              {!isEditingProfile ? (
-                <>
-                  <div className="bg-white p-6 pt-8 pb-10 flex space-x-4 items-center mb-2" onClick={() => {
-                    setEditUsername(currentUserProfile.username);
-                    setIsEditingProfile(true);
-                  }}>
-                    <div className="w-16 h-16 rounded-xl overflow-hidden bg-gray-200 relative group cursor-pointer border border-gray-100">
-                      <img src={currentUserProfile.avatar || defaultAvatar} className="w-full h-full object-cover" alt="avatar" />
-                    </div>
-                    <div className="flex-1 cursor-pointer">
-                      <h2 className="text-xl font-bold text-gray-900">{currentUserProfile.username}</h2>
-                      <p className="text-gray-500 text-sm mt-1">微信号: wxid_{user.uid.substring(0,8)}</p>
-                    </div>
-                    <ChevronLeft className="text-gray-400 rotate-180" size={20}/>
-                  </div>
-                  
-                  <div className="bg-white flex flex-col">
-                    <div className="flex items-center space-x-3 p-4 border-b border-gray-100 active:bg-gray-50">
-                      <Settings className="text-blue-500" size={22}/>
-                      <span className="text-gray-800 flex-1">设置</span>
-                      <ChevronLeft className="text-gray-300 rotate-180" size={20}/>
-                    </div>
-                  </div>
-                </>
-              ) : (
-                // 编辑个人资料页面
-                <div className="bg-white h-full flex flex-col">
-                  <div className="flex items-center justify-between p-4 border-b">
-                    <button onClick={() => setIsEditingProfile(false)} className="text-gray-600">取消</button>
-                    <span className="font-semibold">个人信息</span>
-                    <button onClick={handleSaveProfile} className="text-[#07C160] font-medium">完成</button>
-                  </div>
-                  
-                  <div className="p-6 flex flex-col items-center space-y-8">
-                    {/* 上传头像 */}
-                    <div className="relative">
-                      <div className="w-24 h-24 rounded-xl overflow-hidden bg-gray-200 border-2 border-gray-300">
-                        <img src={currentUserProfile.avatar || defaultAvatar} className="w-full h-full object-cover" alt="avatar" />
-                      </div>
-                      <label className="absolute bottom-0 right-0 bg-[#07C160] p-1.5 rounded-full text-white shadow-lg cursor-pointer hover:bg-[#06ad56]">
-                        <Camera size={16} />
-                        <input type="file" accept="image/*" className="hidden" onChange={handleAvatarUpload} />
-                      </label>
-                    </div>
-
-                    {/* 修改昵称 */}
-                    <div className="w-full">
-                      <label className="text-sm text-gray-500 mb-2 block">名字 (登录名)</label>
-                      <input 
-                        type="text" 
-                        value={editUsername}
-                        onChange={(e) => setEditUsername(e.target.value)}
-                        className="w-full border-b-2 border-[#07C160] outline-none py-2 text-lg transition-colors"
-                        placeholder="输入您的昵称"
-                      />
-                    </div>
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-
-        {/* === 发布动态 Modal (覆盖全屏) === */}
-        {isPosting && (
-          <div className="absolute inset-0 bg-white z-50 flex flex-col animate-in slide-in-from-bottom-4 duration-200">
-            <div className="flex justify-between items-center p-4 pt-12 border-b border-gray-100">
-              <button onClick={() => {
-                setIsPosting(false);
-                setPostMedia(null);
-                setPostMediaType('none');
-              }} className="text-gray-600 flex items-center">
-                取消
-              </button>
-              <button 
-                onClick={handlePublishPost}
-                disabled={!postText.trim() && !postMedia}
-                className="bg-[#07C160] text-white px-4 py-1.5 rounded text-sm font-medium disabled:opacity-50 disabled:bg-[#07C160]/50"
-              >
-                发表
-              </button>
-            </div>
+            <h1 class="text-2xl font-bold mb-8 text-gray-800">欢迎登录</h1>
             
-            <div className="p-4 flex-1 overflow-y-auto">
-              <textarea 
-                className="w-full resize-none outline-none text-[16px] placeholder-gray-400"
-                rows="5"
-                placeholder="这一刻的想法..."
-                value={postText}
-                onChange={(e) => setPostText(e.target.value)}
-                autoFocus
-              ></textarea>
-
-              {/* 媒体预览区 */}
-              {postMedia && (
-                <div className="relative inline-block mt-4">
-                  {postMediaType === 'image' ? (
-                    <img src={postMedia} className="w-28 h-28 object-cover rounded bg-gray-100" alt="preview" />
-                  ) : (
-                    <video src={postMedia} className="w-28 h-28 object-cover rounded bg-black" />
-                  )}
-                  <button 
-                    onClick={() => { setPostMedia(null); setPostMediaType('none'); }}
-                    className="absolute -top-2 -right-2 bg-gray-500 text-white rounded-full p-1"
-                  >
-                    <X size={14} />
-                  </button>
+            <!-- 头像上传 -->
+            <div class="mb-6 relative group cursor-pointer" onclick="document.getElementById('avatar-input').click()">
+                <div id="avatar-preview" class="w-24 h-24 rounded-xl bg-gray-100 border-2 border-dashed border-gray-300 flex items-center justify-center overflow-hidden transition-all group-hover:border-wechat-dark-green">
+                    <i class="fa-solid fa-camera text-gray-400 text-2xl" id="avatar-icon"></i>
                 </div>
-              )}
-
-              {/* 添加媒体按钮 */}
-              {!postMedia && (
-                <div className="mt-4 flex space-x-4">
-                  <label className="w-24 h-24 bg-gray-100 rounded flex flex-col items-center justify-center text-gray-400 cursor-pointer hover:bg-gray-200 transition-colors">
-                    <ImageIcon size={28} className="mb-1" />
-                    <span className="text-xs">图片</span>
-                    <input type="file" accept="image/*" className="hidden" onChange={(e) => handleMediaSelect(e, 'image')} />
-                  </label>
-                  
-                  <label className="w-24 h-24 bg-gray-100 rounded flex flex-col items-center justify-center text-gray-400 cursor-pointer hover:bg-gray-200 transition-colors">
-                    <Video size={28} className="mb-1" />
-                    <span className="text-xs">视频</span>
-                    <input type="file" accept="video/*" className="hidden" onChange={(e) => handleMediaSelect(e, 'video')} />
-                  </label>
-                </div>
-              )}
+                <input type="file" id="avatar-input" accept="image/*" class="hidden" onchange="previewAvatar(event)">
+                <p class="text-xs text-center text-gray-500 mt-2">点击上传头像</p>
             </div>
-          </div>
-        )}
 
-        {/* === 底部导航栏 === */}
-        <div className="flex bg-gray-50 border-t border-gray-200 pb-safe absolute bottom-0 w-full z-10">
-          <NavItem 
-            icon={<MessageCircle size={24} />} 
-            label="微信" 
-            isActive={activeTab === 'chat'} 
-            onClick={() => setActiveTab('chat')} 
-          />
-          <NavItem 
-            icon={<Users size={24} />} 
-            label="通讯录" 
-            isActive={activeTab === 'contacts'} 
-            onClick={() => setActiveTab('contacts')} 
-          />
-          <NavItem 
-            icon={<Compass size={24} />} 
-            label="发现" 
-            isActive={activeTab === 'discover'} 
-            onClick={() => setActiveTab('discover')} 
-          />
-          <NavItem 
-            icon={<User size={24} />} 
-            label="我" 
-            isActive={activeTab === 'me'} 
-            onClick={() => setActiveTab('me')} 
-          />
+            <!-- 用户名输入 -->
+            <div class="w-full max-w-xs mb-8">
+                <input type="text" id="username-input" placeholder="请输入你的用户名" class="w-full border-b-2 border-gray-300 focus:border-wechat-dark-green outline-none py-2 text-lg text-center transition-colors">
+            </div>
+
+            <!-- 登录按钮 -->
+            <button onclick="loginUser()" class="w-full max-w-xs bg-wechat-dark-green text-white py-3 rounded-lg font-bold text-lg hover:bg-green-600 transition-colors active:scale-95">
+                进入微信
+            </button>
         </div>
 
-      </div>
-    </div>
-  );
-}
+        <!-- ================= 主聊天界面 ================= -->
+        <div id="app-screen" class="hidden flex-col h-full w-full">
+            
+            <!-- 顶部导航栏 -->
+            <div class="bg-wechat-header h-14 flex items-center justify-between px-4 border-b border-gray-300 shrink-0">
+                <div class="flex items-center text-wechat-text-dark cursor-pointer" onclick="logout()">
+                    <i class="fa-solid fa-angle-left text-xl mr-2"></i>
+                    <span class="text-lg">退出</span>
+                </div>
+                <h1 class="font-bold text-lg text-wechat-text-dark">群聊大厅 (<span id="user-count">1</span>)</h1>
+                <div class="text-wechat-text-dark text-xl">
+                    <i class="fa-solid fa-ellipsis"></i>
+                </div>
+            </div>
 
-// 底部导航单项组件
-function NavItem({ icon, label, isActive, onClick }) {
-  return (
-    <button 
-      onClick={onClick}
-      className={`flex-1 flex flex-col items-center justify-center py-2 space-y-1 transition-colors ${
-        isActive ? 'text-[#07C160]' : 'text-gray-800'
-      }`}
-    >
-      <div className={isActive ? 'text-[#07C160]' : 'text-gray-900'}>
-        {icon}
-      </div>
-      <span className="text-[10px] font-medium">{label}</span>
-    </button>
-  );
-}<script src="client_api.js"></script>
-</body></html>
+            <!-- 消息列表区 -->
+            <div id="message-list" class="flex-1 overflow-y-auto no-scrollbar p-4 flex flex-col space-y-6">
+                <!-- 消息气泡将在这里动态生成 -->
+            </div>
+
+            <!-- 底部输入栏 -->
+            <div class="bg-wechat-header border-t border-gray-300 p-2 shrink-0 flex items-end space-x-2">
+                <!-- 语音按钮（仅占位装饰） -->
+                <button class="w-10 h-10 rounded-full flex items-center justify-center text-gray-600 hover:bg-gray-200 transition-colors shrink-0">
+                    <i class="fa-solid fa-microphone text-xl"></i>
+                </button>
+                
+                <!-- 文本输入框 -->
+                <textarea id="text-input" rows="1" class="flex-1 rounded-md py-2 px-3 outline-none text-base resize-none max-h-32 overflow-y-auto" placeholder="发消息..." oninput="autoResize(this)"></textarea>
+                
+                <!-- 发送按钮 (初始隐藏) -->
+                <button id="send-btn" onclick="sendTextMessage()" class="hidden bg-wechat-dark-green text-white px-4 py-2 rounded text-sm font-bold shrink-0">发送</button>
+                
+                <!-- 多媒体上传按钮 -->
+                <button id="add-btn" class="w-10 h-10 rounded-full flex items-center justify-center text-gray-600 hover:bg-gray-200 transition-colors shrink-0" onclick="document.getElementById('media-input').click()">
+                    <i class="fa-solid fa-circle-plus text-2xl"></i>
+                </button>
+                <input type="file" id="media-input" accept="image/*,video/*" class="hidden" onchange="sendMediaMessage(event)">
+            </div>
+        </div>
+    </div>
+
+    <!-- ================= 核心底层逻辑代码 ================= -->
+    <script>
+        /**
+         * 数据库接口层 (Database Interface)
+         * 使用 HTML5 IndexedDB 来实现本地持久化存储，支持存储大文件（Blob类型的图片和视频）
+         */
+        const DB_NAME = 'WeChatMockDB';
+        const DB_VERSION = 1;
+        let dbInstance = null;
+
+        const AppDB = {
+            // 初始化数据库连接
+            init: function() {
+                return new Promise((resolve, reject) => {
+                    const request = indexedDB.open(DB_NAME, DB_VERSION);
+                    
+                    request.onupgradeneeded = (event) => {
+                        const db = event.target.result;
+                        // 表1：用户表（键值：用户名）
+                        if (!db.objectStoreNames.contains('users')) {
+                            db.createObjectStore('users', { keyPath: 'username' });
+                        }
+                        // 表2：消息表（键值：自增ID）
+                        if (!db.objectStoreNames.contains('messages')) {
+                            const msgStore = db.createObjectStore('messages', { keyPath: 'id', autoIncrement: true });
+                            // 创建针对用户名的索引，方便查询特定用户的消息
+                            msgStore.createIndex('username', 'username', { unique: false });
+                            msgStore.createIndex('timestamp', 'timestamp', { unique: false });
+                        }
+                    };
+
+                    request.onsuccess = (event) => {
+                        dbInstance = event.target.result;
+                        resolve(dbInstance);
+                    };
+
+                    request.onerror = (event) => {
+                        console.error('数据库初始化失败:', event.target.error);
+                        reject(event.target.error);
+                    };
+                });
+            },
+
+            // 接口：保存/更新用户信息 (包含用户名和头像Blob)
+            saveUser: function(userObj) {
+                return new Promise((resolve, reject) => {
+                    const transaction = dbInstance.transaction(['users'], 'readwrite');
+                    const store = transaction.objectStore('users');
+                    const request = store.put(userObj);
+                    request.onsuccess = () => resolve(true);
+                    request.onerror = (e) => reject(e.target.error);
+                });
+            },
+
+            // 接口：获取特定用户信息
+            getUser: function(username) {
+                return new Promise((resolve, reject) => {
+                    const transaction = dbInstance.transaction(['users'], 'readonly');
+                    const store = transaction.objectStore('users');
+                    const request = store.get(username);
+                    request.onsuccess = (e) => resolve(e.target.result);
+                    request.onerror = (e) => reject(e.target.error);
+                });
+            },
+
+            // 接口：获取所有用户（用于头像映射和统计）
+            getAllUsers: function() {
+                return new Promise((resolve, reject) => {
+                    const transaction = dbInstance.transaction(['users'], 'readonly');
+                    const store = transaction.objectStore('users');
+                    const request = store.getAll();
+                    request.onsuccess = (e) => resolve(e.target.result);
+                    request.onerror = (e) => reject(e.target.error);
+                });
+            },
+
+            // 接口：保存消息记录 (支持文字文本，或者图片/视频的Blob数据)
+            saveMessage: function(msgObj) {
+                return new Promise((resolve, reject) => {
+                    const transaction = dbInstance.transaction(['messages'], 'readwrite');
+                    const store = transaction.objectStore('messages');
+                    const request = store.add(msgObj);
+                    request.onsuccess = (e) => {
+                        msgObj.id = e.target.result; // 获取自增插入的ID
+                        resolve(msgObj);
+                    };
+                    request.onerror = (e) => reject(e.target.error);
+                });
+            },
+
+            // 接口：获取所有历史消息并按时间排序
+            getAllMessages: function() {
+                return new Promise((resolve, reject) => {
+                    const transaction = dbInstance.transaction(['messages'], 'readonly');
+                    const store = transaction.objectStore('messages');
+                    const request = store.getAll();
+                    request.onsuccess = (e) => {
+                        let messages = e.target.result;
+                        messages.sort((a, b) => a.timestamp - b.timestamp);
+                        resolve(messages);
+                    };
+                    request.onerror = (e) => reject(e.target.error);
+                });
+            }
+        };
+
+        // ================= 业务逻辑与 UI 交互 =================
+
+        let currentUser = null;          // 当前登录的用户对象
+        let currentAvatarBlob = null;    // 登录时暂存的头像文件数据
+        let objectUrlCache = {};         // 缓存 blob URLs 避免内存泄漏
+        let allUsersMap = {};            // 缓存所有用户头像以便渲染历史消息
+
+        // 页面初始化
+        window.onload = async () => {
+            try {
+                await AppDB.init();
+                console.log("数据库加载成功！");
+                
+                // 检查是否已经登录（刷新页面保持登录状态）
+                const savedSession = sessionStorage.getItem('currentWeChatUser');
+                if (savedSession) {
+                    currentUser = await AppDB.getUser(savedSession);
+                    if (currentUser) {
+                        enterApp();
+                    }
+                }
+            } catch (error) {
+                alert("数据库初始化失败，请使用支持 IndexedDB 的现代浏览器。");
+            }
+
+            // 监听输入框变化，切换发送/添加按钮
+            const textInput = document.getElementById('text-input');
+            const sendBtn = document.getElementById('send-btn');
+            const addBtn = document.getElementById('add-btn');
+
+            textInput.addEventListener('input', () => {
+                if (textInput.value.trim().length > 0) {
+                    sendBtn.classList.remove('hidden');
+                    addBtn.classList.add('hidden');
+                } else {
+                    sendBtn.classList.add('hidden');
+                    addBtn.classList.remove('hidden');
+                }
+            });
+            
+            // 监听回车键发送
+            textInput.addEventListener('keypress', (e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    sendTextMessage();
+                }
+            });
+        };
+
+        // 自动调整输入框高度
+        function autoResize(textarea) {
+            textarea.style.height = 'auto';
+            textarea.style.height = textarea.scrollHeight + 'px';
+        }
+
+        // 头像预览处理
+        function previewAvatar(event) {
+            const file = event.target.files[0];
+            if (file) {
+                currentAvatarBlob = file;
+                const url = URL.createObjectURL(file);
+                const previewDiv = document.getElementById('avatar-preview');
+                previewDiv.innerHTML = `<img src="${url}" class="w-full h-full object-cover" />`;
+            }
+        }
+
+        // 登录/注册逻辑
+        async function loginUser() {
+            const usernameInput = document.getElementById('username-input').value.trim();
+            if (!usernameInput) {
+                alert("请输入用户名！");
+                return;
+            }
+
+            let user = await AppDB.getUser(usernameInput);
+            
+            if (!user) {
+                // 新用户注册
+                if (!currentAvatarBlob) {
+                    alert("新用户请先上传一个头像！");
+                    return;
+                }
+                user = {
+                    username: usernameInput,
+                    avatar: currentAvatarBlob
+                };
+                await AppDB.saveUser(user);
+            } else {
+                // 老用户登录，如果选了新头像则更新
+                if (currentAvatarBlob) {
+                    user.avatar = currentAvatarBlob;
+                    await AppDB.saveUser(user);
+                }
+            }
+
+            currentUser = user;
+            sessionStorage.setItem('currentWeChatUser', user.username);
+            enterApp();
+        }
+
+        // 退出登录
+        function logout() {
+            sessionStorage.removeItem('currentWeChatUser');
+            currentUser = null;
+            document.getElementById('app-screen').classList.add('hidden');
+            document.getElementById('login-screen').classList.remove('hidden');
+            // 清理输入框
+            document.getElementById('username-input').value = '';
+            document.getElementById('avatar-preview').innerHTML = `<i class="fa-solid fa-camera text-gray-400 text-2xl" id="avatar-icon"></i>`;
+            currentAvatarBlob = null;
+        }
+
+        // 进入主界面
+        async function enterApp() {
+            document.getElementById('login-screen').classList.add('hidden');
+            document.getElementById('app-screen').classList.remove('hidden');
+            document.getElementById('app-screen').classList.add('flex');
+            
+            // 刷新用户映射表
+            const users = await AppDB.getAllUsers();
+            document.getElementById('user-count').innerText = users.length;
+            
+            allUsersMap = {};
+            for (let u of users) {
+                if (u.avatar) {
+                    allUsersMap[u.username] = URL.createObjectURL(u.avatar);
+                }
+            }
+
+            // 加载历史消息
+            loadMessages();
+        }
+
+        // ================= 消息发送与渲染 =================
+
+        // 发送文本消息
+        async function sendTextMessage() {
+            const input = document.getElementById('text-input');
+            const text = input.value.trim();
+            if (!text) return;
+
+            const msgObj = {
+                username: currentUser.username,
+                type: 'text',
+                content: text,
+                timestamp: Date.now()
+            };
+
+            await AppDB.saveMessage(msgObj);
+            
+            // 清空输入框并重置高度
+            input.value = '';
+            input.style.height = 'auto';
+            document.getElementById('send-btn').classList.add('hidden');
+            document.getElementById('add-btn').classList.remove('hidden');
+            
+            renderSingleMessage(msgObj);
+            scrollToBottom();
+        }
+
+        // 发送多媒体消息 (图片/视频)
+        async function sendMediaMessage(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const isVideo = file.type.startsWith('video/');
+            const type = isVideo ? 'video' : 'image';
+
+            const msgObj = {
+                username: currentUser.username,
+                type: type,
+                content: file, // 直接将文件 Blob 存入数据库
+                timestamp: Date.now()
+            };
+
+            await AppDB.saveMessage(msgObj);
+            renderSingleMessage(msgObj);
+            scrollToBottom();
+            
+            // 重置 input file 以便下次选择同一文件也能触发 change
+            event.target.value = ''; 
+        }
+
+        // 加载并渲染所有历史消息
+        async function loadMessages() {
+            const listContainer = document.getElementById('message-list');
+            listContainer.innerHTML = ''; // 清空当前列表
+            
+            const messages = await AppDB.getAllMessages();
+            for (let msg of messages) {
+                renderSingleMessage(msg);
+            }
+            setTimeout(scrollToBottom, 100);
+        }
+
+        // 渲染单条消息到屏幕上
+        function renderSingleMessage(msg) {
+            const listContainer = document.getElementById('message-list');
+            const isMe = msg.username === currentUser.username;
+            
+            // 获取头像URL
+            let avatarUrl = allUsersMap[msg.username] || 'https://via.placeholder.com/150';
+
+            // 处理消息内容展示
+            let contentHTML = '';
+            if (msg.type === 'text') {
+                contentHTML = `<p class="whitespace-pre-wrap word-break">${escapeHTML(msg.content)}</p>`;
+            } else if (msg.type === 'image') {
+                const imgUrl = URL.createObjectURL(msg.content);
+                contentHTML = `<img src="${imgUrl}" class="max-w-[200px] max-h-[200px] rounded-lg cursor-pointer" onclick="window.open('${imgUrl}')"/>`;
+            } else if (msg.type === 'video') {
+                const vidUrl = URL.createObjectURL(msg.content);
+                contentHTML = `<video src="${vidUrl}" controls class="max-w-[200px] max-h-[200px] rounded-lg bg-black"></video>`;
+            }
+
+            // 构建 DOM 结构 (区分左右排列)
+            const msgDiv = document.createElement('div');
+            msgDiv.className = `flex w-full ${isMe ? 'justify-end' : 'justify-start'}`;
+
+            const timeString = new Date(msg.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+
+            if (isMe) {
+                // 自己发出的消息在右侧
+                msgDiv.innerHTML = `
+                    <div class="flex items-start max-w-[80%]">
+                        <div class="flex flex-col items-end mr-3">
+                            <span class="text-xs text-gray-400 mb-1">${timeString}</span>
+                            <div class="relative bg-wechat-green text-black px-3 py-2 rounded-lg text-base shadow-sm bubble-right">
+                                ${contentHTML}
+                            </div>
+                        </div>
+                        <img src="${avatarUrl}" class="w-10 h-10 rounded-md shrink-0 object-cover bg-white">
+                    </div>
+                `;
+            } else {
+                // 别人发出的消息在左侧
+                msgDiv.innerHTML = `
+                    <div class="flex items-start max-w-[80%]">
+                        <img src="${avatarUrl}" class="w-10 h-10 rounded-md shrink-0 object-cover bg-white">
+                        <div class="flex flex-col items-start ml-3">
+                            <span class="text-xs text-gray-500 mb-1">${msg.username} · ${timeString}</span>
+                            <div class="relative bg-white text-black px-3 py-2 rounded-lg text-base shadow-sm bubble-left">
+                                ${contentHTML}
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            listContainer.appendChild(msgDiv);
+        }
+
+        // 辅助工具：防 XSS 注入
+        function escapeHTML(str) {
+            return str.replace(/[&<>'"]/g, 
+                tag => ({
+                    '&': '&amp;',
+                    '<': '&lt;',
+                    '>': '&gt;',
+                    "'": '&#39;',
+                    '"': '&quot;'
+                }[tag] || tag)
+            );
+        }
+
+        // 辅助工具：滚动到底部
+        function scrollToBottom() {
+            const listContainer = document.getElementById('message-list');
+            listContainer.scrollTop = listContainer.scrollHeight;
+        }
+
+    </script>
+<script src="client_api.js"></script>
+</body>
+</html>
