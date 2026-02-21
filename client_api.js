@@ -8,14 +8,14 @@ document.addEventListener('DOMContentLoaded', () => {
             e.preventDefault();
             const data = Object.fromEntries(new FormData(form));
             try {
-                const res = await fetch(API_BASE + '/data', {
+                const res = await fetch(API_BASE, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(data)
                 });
                 if(res.ok) { alert('Data Submitted Successfully!'); form.reset(); }
                 else alert('Error submitting data');
-            } catch (err) { console.error('API Error:', err); alert('Network Error'); }
+                } catch (err) { console.error('API Error:', err); alert('Network Error'); }
+            });
         });
-    });
-});
+        });
